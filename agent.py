@@ -5,7 +5,15 @@ from openai import OpenAI
 from tools import get_customer_profile, check_watchlist, count_recent_txns, check_amount
 from tracing import Trace
 
+import mlflow
+from mlflow.entities import SpanType
+
 load_dotenv()
+
+mlflow.set_tracking_uri("http://127.0.0.1:5000")
+mlflow.set_experiment("txn-risk-agent")
+mlflow.openai.autolog()
+
 client = OpenAI()
 MODEL = "gpt-4o-mini"
 
@@ -39,12 +47,15 @@ TOOLS = [
                        "required": ["customer_id", "amount"]}}},
 ]
 
-# 2. Map tool names to the real Python functions
+# 2. 
 TOOL_FUNCS = {
-    "get_customer_profile": get_customer_profile,
-    "check_watchlist": check_watchlist,
-    "count_recent_txns": count_recent_txns,
-    "check_amount": check_amount,
+    name: mlflow.trace(fn, name=name, span_type=SpanType.TOOL)
+    for name, fn in {
+        "get_customer_profile": get_customer_profile,
+        "check_watchlist": check_watchlist,
+        "count_recent_txns": count_recent_txns,
+        "check_amount": check_amount,
+    }.items()
 }
 
 SOFT_FLAGS = {"foreign country"}
@@ -90,6 +101,7 @@ def find_red_flags(name, result, txn):
 
 
 # 4. Required checks: code ALWAYS runs these, the agent can't skip them
+@mlflow.trace(span_type=SpanType.CHAIN)
 def run_required_checks(txn):
     checks = [
         ("get_customer_profile", {"customer_id": txn["customer"]}),
@@ -108,6 +120,7 @@ def run_required_checks(txn):
 
 
 # 5. Note check: LLM EXTRACTS the facts, code VERIFIES them
+@mlflow.trace(span_type=SpanType.PARSER)
 def extract_note(note, trace):
     t0 = time.perf_counter()
     response = client.chat.completions.create(
@@ -127,6 +140,7 @@ def extract_note(note, trace):
         return {}
 
 
+@mlflow.trace(span_type=SpanType.CHAIN)
 def check_note(txn, trace):
     note, date = txn.get("note"), txn.get("date")
     if not note or not date:
@@ -146,6 +160,7 @@ def check_note(txn, trace):
 
 
 # 6. The agent loop
+@mlflow.trace(span_type=SpanType.AGENT)
 def run_agent(txn, max_steps=6, verbose=True):
     trace = Trace(txn)
 
@@ -205,7 +220,10 @@ def run_agent(txn, max_steps=6, verbose=True):
 
             if overridden:
                 trace.log("guardrail_override", model_said=model_answer, replaced_with=answer)
-
+            mlflow.update_current_trace(tags={
+                "verdict": "FLAG" if "VERDICT: FLAG" in answer.upper() else "CLEAR",
+                "guardrail_override": str(overridden),
+            })
             trace.finish(answer, model_answer, overridden)
             return answer, tools_used
 
