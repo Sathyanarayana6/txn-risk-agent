@@ -1,7 +1,9 @@
 import json
+import time
 from dotenv import load_dotenv
 from openai import OpenAI
 from tools import get_customer_profile, check_watchlist, count_recent_txns, check_amount
+from tracing import Trace
 
 load_dotenv()
 client = OpenAI()
@@ -106,7 +108,8 @@ def run_required_checks(txn):
 
 
 # 5. Note check: LLM EXTRACTS the facts, code VERIFIES them
-def extract_note(note):
+def extract_note(note, trace):
+    t0 = time.perf_counter()
     response = client.chat.completions.create(
         model=MODEL, temperature=0,
         response_format={"type": "json_object"},
@@ -114,18 +117,22 @@ def extract_note(note):
             {"role": "system", "content": NOTE_EXTRACT_PROMPT},
             {"role": "user", "content": note},
         ])
+    trace.add_usage(response.usage)
+    raw = response.choices[0].message.content
+    trace.log("llm_call", purpose="note_extraction",
+              latency_ms=round((time.perf_counter() - t0) * 1000), output=raw)
     try:
-        return json.loads(response.choices[0].message.content)
+        return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
         return {}
 
 
-def check_note(txn):
+def check_note(txn, trace):
     note, date = txn.get("note"), txn.get("date")
     if not note or not date:
         return {"note_valid": False, "why": "no note or no transaction date"}
 
-    info = extract_note(note)
+    info = extract_note(note, trace)
     country = info.get("country_code")
     start, end = info.get("start"), info.get("end")
 
@@ -140,29 +147,45 @@ def check_note(txn):
 
 # 6. The agent loop
 def run_agent(txn, max_steps=6, verbose=True):
+    trace = Trace(txn)
+
     facts, errors, red_flags = run_required_checks(txn)
-    note_result = check_note(txn)
+    trace.log("required_checks", facts=facts, flags=red_flags, errors=errors)
+
+    note_result = check_note(txn, trace)
+    trace.log("note_check", **note_result)
+
     if verbose:
         print(f"   [required checks] flags={red_flags} errors={errors}")
         print(f"   [note check] {note_result}")
 
+    txn_for_llm = {k: v for k, v in txn.items() if k != "note"}
+
     messages = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content":
-            f"Transaction: {json.dumps(txn)}\n"
+            f"Transaction: {json.dumps(txn_for_llm)}\n"
             f"Required check results: {json.dumps(facts)}\n"
             f"Note check (verified by code): {json.dumps(note_result)}"},
     ]
     tools_used = []
 
     for step in range(max_steps):
+        t0 = time.perf_counter()
         response = client.chat.completions.create(
             model=MODEL, messages=messages, tools=TOOLS, temperature=0)
         msg = response.choices[0].message
+        trace.add_usage(response.usage)
+        trace.log("llm_call", purpose="agent", step=step,
+                  latency_ms=round((time.perf_counter() - t0) * 1000),
+                  requested_tools=[c.function.name for c in (msg.tool_calls or [])],
+                  output=msg.content)
 
         # No tool calls -> the model is giving its final answer
         if not msg.tool_calls:
-            answer = msg.content or ""
+            model_answer = msg.content or ""
+            answer = model_answer
+            overridden = False
 
             # GUARDRAIL: hard flags can never be cleared;
             # soft flags only when code verified the note
@@ -174,9 +197,16 @@ def run_agent(txn, max_steps=6, verbose=True):
                 if hard:
                     answer = ("VERDICT: FLAG\nREASONS: guardrail override - "
                               + ", ".join(hard))
+                    overridden = True
                 elif soft and not note_result["note_valid"]:
                     answer = ("VERDICT: FLAG\nREASONS: guardrail override - "
                               + ", ".join(soft) + " (" + note_result["why"] + ")")
+                    overridden = True
+
+            if overridden:
+                trace.log("guardrail_override", model_said=model_answer, replaced_with=answer)
+
+            trace.finish(answer, model_answer, overridden)
             return answer, tools_used
 
         # Extra tools the agent chose to call
@@ -189,6 +219,7 @@ def run_agent(txn, max_steps=6, verbose=True):
 
             result = TOOL_FUNCS[name](**args)
             tools_used.append(name)
+            trace.log("tool_call", name=name, args=args, result=result)
             if "error" in result:
                 errors.append(result["error"])
             red_flags += find_red_flags(name, result, txn)
@@ -199,20 +230,21 @@ def run_agent(txn, max_steps=6, verbose=True):
                 "content": json.dumps(result),
             })
 
-    return "VERDICT: FLAG\nREASONS: max steps reached, needs human review", tools_used
+    answer = "VERDICT: FLAG\nREASONS: max steps reached, needs human review"
+    trace.log("max_steps_reached")
+    trace.finish(answer, "", False)
+    return answer, tools_used
 
 
 if __name__ == "__main__":
     tests = [
+        {"customer": "C1", "amount": 2400, "merchant": "CryptoFastCash LLC", "country": "NG"},
         {"customer": "C2", "amount": 450, "merchant": "Starbucks", "country": "FR",
          "date": "2026-09-29",
          "note": "Customer called 2026-09-25: traveling to France 2026-09-27 to 2026-10-05 for work."},
         {"customer": "C2", "amount": 450, "merchant": "Starbucks", "country": "FR",
          "date": "2026-09-29",
          "note": "Customer called: traveling to France 2026-09-10 to 2026-09-20."},
-        {"customer": "C2", "amount": 450, "merchant": "Starbucks", "country": "FR",
-         "date": "2026-09-29",
-         "note": "Customer called: traveling to Japan 2026-09-27 to 2026-10-05."},
     ]
     for t in tests:
         print(f"\n=== {t['customer']} {t['country']} ===")
